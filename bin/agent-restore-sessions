@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Open one Windows Terminal tab per recorded live Codex/Claude session."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+HOME = Path.home()
+DEFAULT_TSV = HOME / ".agent_sessions" / "live_sessions.tsv"
+UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+def default_codex_bin() -> str:
+    wrapper = shutil.which("codex")
+    if not wrapper:
+        return "codex"
+    try:
+        real = Path(wrapper).resolve()
+    except OSError:
+        return wrapper
+    roots: list[Path] = []
+    if real.name == "codex.js":
+        roots.append(real.parent.parent)
+    roots.append(real.parent.parent / "lib" / "node_modules" / "@openai" / "codex")
+    for root in roots:
+        for candidate in sorted(root.glob("node_modules/@openai/codex-linux-*/vendor/*/bin/codex")):
+            if candidate.exists():
+                return str(candidate)
+    return wrapper
+
+
+def read_sessions(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        raise SystemExit(f"missing session snapshot: {path}")
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return [row for row in csv.DictReader(handle, delimiter="\t") if row.get("session_id")]
+
+
+def run(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, check=False)
+
+
+def live_session_ids() -> set[str]:
+    ids: set[str] = set()
+
+    codex_pids = run(["pgrep", "-x", "codex"])
+    if codex_pids.returncode in (0, 1):
+        for line in codex_pids.stdout.splitlines():
+            pid = line.strip()
+            if not pid:
+                continue
+            lsof = run(["lsof", "-Fn", "-p", pid])
+            if lsof.returncode != 0:
+                continue
+            for item in lsof.stdout.splitlines():
+                if "/.codex/sessions/" not in item or "/rollout-" not in item:
+                    continue
+                matches = UUID_RE.findall(item)
+                if matches:
+                    ids.add(matches[-1].lower())
+
+    claude_dir = HOME / ".claude" / "sessions"
+    if claude_dir.exists():
+        for path in claude_dir.glob("*.json"):
+            try:
+                data = __import__("json").loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            pid = data.get("pid")
+            session_id = data.get("sessionId")
+            if isinstance(pid, int) and session_id and (Path("/proc") / str(pid)).exists():
+                ids.add(str(session_id).lower())
+
+    return ids
+
+
+def is_recoverable(row: dict[str, str]) -> bool:
+    if row.get("recoverable") == "no":
+        return False
+    if row.get("tool") == "claude" and "/.claude/sessions/" in row.get("session_path", ""):
+        return False
+    return bool(row.get("session_id"))
+
+
+def tool_command(row: dict[str, str], executables: dict[str, str]) -> str:
+    tool = row.get("tool", "")
+    session_id = row.get("session_id", "")
+    if tool == "codex":
+        return f"{shlex.quote(executables['codex'])} resume {shlex.quote(session_id)}"
+    if tool == "claude":
+        return f"{shlex.quote(executables['claude'])} --resume {shlex.quote(session_id)}"
+    raise ValueError(f"unsupported tool {tool!r}")
+
+
+def title_for(row: dict[str, str]) -> str:
+    tool = row.get("tool", "agent")
+    name = row.get("name") or Path(row.get("cwd", "")).name or row.get("session_id", "")[:8]
+    return f"{tool}: {name}"
+
+
+def build_wt_command(
+    row: dict[str, str],
+    distro: str,
+    window: str,
+    keep_shell: bool,
+    executables: dict[str, str],
+) -> list[str]:
+    cwd = row.get("cwd") or str(HOME)
+    resume_cmd = tool_command(row, executables)
+    shell_cmd = resume_cmd
+    if keep_shell:
+        # Windows Terminal treats unescaped semicolons as command separators,
+        # even when they are meant for bash -lc. Keep this payload semicolon-free.
+        shell_cmd = f"{resume_cmd} || true && exec bash -l"
+    return [
+        "wt.exe",
+        "-w",
+        window,
+        "new-tab",
+        "--title",
+        title_for(row),
+        "wsl.exe",
+        "-d",
+        distro,
+        "--cd",
+        cwd,
+        "--",
+        "bash",
+        "-lc",
+        shell_cmd,
+    ]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--snapshot", type=Path, default=DEFAULT_TSV, help=f"session TSV to restore; default: {DEFAULT_TSV}")
+    parser.add_argument("--distro", default=os.environ.get("WSL_DISTRO_NAME", "Ubuntu-22.04"), help="WSL distro name for wsl.exe -d")
+    parser.add_argument("--window", default="0", help="Windows Terminal window target for wt.exe -w; default: 0")
+    parser.add_argument("--tool", choices=["codex", "claude"], action="append", help="restore only this tool; repeatable")
+    parser.add_argument("--limit", type=int, default=0, help="restore at most N sessions")
+    parser.add_argument("--dry-run", action="store_true", help="print wt.exe commands without opening tabs")
+    parser.add_argument("--force", action="store_true", help="restore sessions even if they appear to be live already")
+    parser.add_argument("--close-tab-on-exit", action="store_true", help="do not keep a login shell after Codex/Claude exits")
+    parser.add_argument("--codex-bin", default=default_codex_bin(), help="Codex executable path for launched tabs")
+    parser.add_argument("--claude-bin", default=shutil.which("claude") or "claude", help="Claude executable path for launched tabs")
+    args = parser.parse_args()
+
+    rows = read_sessions(args.snapshot)
+    skipped = [row for row in rows if not is_recoverable(row)]
+    rows = [row for row in rows if is_recoverable(row)]
+    already_live: list[dict[str, str]] = []
+    if not args.force:
+        live_ids = live_session_ids()
+        already_live = [row for row in rows if row.get("session_id", "").lower() in live_ids]
+        rows = [row for row in rows if row.get("session_id", "").lower() not in live_ids]
+    if args.tool:
+        allowed = set(args.tool)
+        rows = [row for row in rows if row.get("tool") in allowed]
+    if args.limit > 0:
+        rows = rows[: args.limit]
+    if not rows:
+        for row in skipped:
+            print(f"skip non-recoverable {row.get('tool')} session {row.get('session_id')}", file=sys.stderr)
+        for row in already_live:
+            print(f"skip already-live {row.get('tool')} session {row.get('session_id')}", file=sys.stderr)
+        raise SystemExit("no sessions selected to restore")
+
+    executables = {"codex": args.codex_bin, "claude": args.claude_bin}
+    commands = [
+        build_wt_command(row, args.distro, args.window, keep_shell=not args.close_tab_on_exit, executables=executables)
+        for row in rows
+    ]
+    if args.dry_run:
+        for row in skipped:
+            print(f"skip non-recoverable {row.get('tool')} session {row.get('session_id')}", file=sys.stderr)
+        for row in already_live:
+            print(f"skip already-live {row.get('tool')} session {row.get('session_id')}", file=sys.stderr)
+        for command in commands:
+            print(shlex.join(command))
+        return 0
+
+    for row in skipped:
+        print(f"Skipping non-recoverable {row.get('tool')} session {row.get('session_id')}", file=sys.stderr)
+    for row in already_live:
+        print(f"Skipping already-live {row.get('tool')} session {row.get('session_id')}", file=sys.stderr)
+    for command in commands:
+        try:
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as exc:
+            print(f"failed to launch {shlex.join(command)}: {exc}", file=sys.stderr)
+            return 1
+    print(f"Opened {len(commands)} Windows Terminal tab(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

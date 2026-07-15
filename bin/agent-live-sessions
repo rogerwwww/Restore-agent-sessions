@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Snapshot live Codex and Claude CLI sessions for reboot recovery."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+HOME = Path.home()
+OUT_DIR = HOME / ".agent_sessions"
+CODEX_SESSIONS = HOME / ".codex" / "sessions"
+CLAUDE_SESSIONS = HOME / ".claude" / "sessions"
+UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+def run(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, check=False)
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def proc_exists(pid: int) -> bool:
+    return (Path("/proc") / str(pid)).exists()
+
+
+def proc_cmdline(pid: int) -> str:
+    path = Path("/proc") / str(pid) / "cmdline"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return data.replace(b"\x00", b" ").decode(errors="replace").strip()
+
+
+def proc_cwd(pid: int) -> str:
+    try:
+        return str((Path("/proc") / str(pid) / "cwd").resolve())
+    except OSError:
+        return ""
+
+
+def proc_start_ticks(pid: int) -> str:
+    try:
+        fields = (Path("/proc") / str(pid) / "stat").read_text().split()
+    except OSError:
+        return ""
+    return fields[21] if len(fields) > 21 else ""
+
+
+def ps_field(pid: int, field: str) -> str:
+    result = run(["ps", "-p", str(pid), "-o", f"{field}="])
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def pids_by_exact_name(name: str) -> list[int]:
+    result = run(["pgrep", "-x", name])
+    if result.returncode not in (0, 1):
+        return []
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        try:
+            pids.append(int(line.strip()))
+        except ValueError:
+            pass
+    return sorted(set(pids))
+
+
+def lsof_names(pid: int) -> list[str]:
+    result = run(["lsof", "-Fn", "-p", str(pid)])
+    if result.returncode != 0:
+        return []
+    names: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("n"):
+            names.append(line[1:])
+    return names
+
+
+def mtime_iso(path: str) -> str:
+    try:
+        return dt.datetime.fromtimestamp(Path(path).stat().st_mtime, dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+    except OSError:
+        return ""
+
+
+def extract_codex_session_id(path: str) -> str:
+    name = Path(path).name
+    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+        return ""
+    matches = UUID_RE.findall(name)
+    return matches[-1].lower() if matches else ""
+
+
+def first_jsonl_value(path: str, keys: list[str]) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for key in keys:
+                    value = item
+                    for part in key.split("."):
+                        if not isinstance(value, dict) or part not in value:
+                            value = None
+                            break
+                        value = value[part]
+                    if isinstance(value, str) and value:
+                        return value
+    except OSError:
+        pass
+    return ""
+
+
+def scan_codex() -> list[dict[str, Any]]:
+    sessions: dict[str, dict[str, Any]] = {}
+    for pid in pids_by_exact_name("codex"):
+        if not proc_exists(pid):
+            continue
+        names = lsof_names(pid)
+        session_paths = [
+            name
+            for name in names
+            if "/.codex/sessions/" in name
+            and "/rollout-" in name
+            and name.endswith(".jsonl")
+        ]
+        for session_path in sorted(set(session_paths)):
+            session_id = extract_codex_session_id(session_path)
+            if not session_id:
+                continue
+            cwd = proc_cwd(pid) or first_jsonl_value(session_path, ["payload.cwd", "cwd"])
+            sessions[session_id] = {
+                "tool": "codex",
+                "session_id": session_id,
+                "pid": pid,
+                "tty": ps_field(pid, "tty"),
+                "status": ps_field(pid, "stat"),
+                "name": "",
+                "cwd": cwd,
+                "started": ps_field(pid, "lstart"),
+                "updated": mtime_iso(session_path),
+                "session_path": session_path,
+                "recoverable": "yes",
+                "resume": f"cd {shell_quote(cwd)} && codex resume {session_id}" if cwd else f"codex resume {session_id}",
+            }
+    return sorted(sessions.values(), key=lambda row: (row["tool"], row["cwd"], row["session_id"]))
+
+
+def shell_quote(value: str) -> str:
+    if not value:
+        return "''"
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def claude_project_path(cwd: str, session_id: str) -> str:
+    if not cwd or not session_id:
+        return ""
+    encoded = cwd.replace("/", "-").replace(" ", "-")
+    path = HOME / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+    return str(path) if path.exists() else ""
+
+
+def scan_claude() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not CLAUDE_SESSIONS.exists():
+        return rows
+    for path in sorted(CLAUDE_SESSIONS.glob("*.json")):
+        data = read_json(path)
+        pid = data.get("pid")
+        session_id = str(data.get("sessionId") or "")
+        if not isinstance(pid, int) or not session_id:
+            continue
+        if not proc_exists(pid):
+            continue
+        cmdline = proc_cmdline(pid)
+        if "claude" not in cmdline and Path(f"/proc/{pid}/exe").exists():
+            try:
+                exe = str(Path(f"/proc/{pid}/exe").resolve())
+            except OSError:
+                exe = ""
+            if "claude" not in exe:
+                continue
+        saved_start = str(data.get("procStart") or "")
+        live_start = proc_start_ticks(pid)
+        if saved_start and live_start and saved_start != live_start:
+            continue
+        cwd = str(data.get("cwd") or proc_cwd(pid))
+        project_path = claude_project_path(cwd, session_id)
+        recoverable = bool(project_path)
+        rows.append(
+            {
+                "tool": "claude",
+                "session_id": session_id,
+                "pid": pid,
+                "tty": ps_field(pid, "tty"),
+                "status": str(data.get("status") or ps_field(pid, "stat")),
+                "name": str(data.get("name") or ""),
+                "cwd": cwd,
+                "started": ms_to_iso(data.get("startedAt")) or ps_field(pid, "lstart"),
+                "updated": ms_to_iso(data.get("updatedAt")) or mtime_iso(str(path)),
+                "session_path": project_path or str(path),
+                "recoverable": "yes" if recoverable else "no",
+                "resume": (
+                    f"cd {shell_quote(cwd)} && claude --resume {session_id}"
+                    if recoverable and cwd
+                    else f"claude --resume {session_id}"
+                    if recoverable
+                    else ""
+                ),
+            }
+        )
+    return sorted(rows, key=lambda row: (row["tool"], row["cwd"], row["session_id"]))
+
+
+def ms_to_iso(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return ""
+    return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fields = [
+        "tool",
+        "session_id",
+        "pid",
+        "tty",
+        "status",
+        "name",
+        "cwd",
+        "started",
+        "updated",
+        "session_path",
+        "recoverable",
+        "resume",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fields, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_markdown(path: Path, rows: list[dict[str, Any]], scanned_at: str) -> None:
+    lines = [
+        "# Live Agent Sessions",
+        "",
+        f"Scanned: `{scanned_at}`",
+        "",
+    ]
+    if not rows:
+        lines.extend(["No live Codex or Claude CLI sessions were detected.", ""])
+    for tool in ("codex", "claude"):
+        tool_rows = [row for row in rows if row["tool"] == tool]
+        if not tool_rows:
+            continue
+        lines.extend([f"## {tool.capitalize()}", ""])
+        for row in tool_rows:
+            title = row["name"] or row["cwd"] or row["session_id"]
+            lines.extend(
+                [
+                    f"### {title}",
+                    "",
+                    f"- Session: `{row['session_id']}`",
+                    f"- PID: `{row['pid']}` on `{row['tty']}`",
+                    f"- CWD: `{row['cwd']}`",
+                    f"- Updated: `{row['updated']}`",
+                    f"- Path: `{row['session_path']}`",
+                ]
+            )
+            if row.get("recoverable") == "no":
+                lines.extend(
+                    [
+                        "- Recoverable: `no`",
+                        "- Note: live Claude runtime marker exists, but no persisted project transcript was found yet.",
+                        "",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        f"- Recoverable: `{row.get('recoverable', 'yes')}`",
+                        "- Resume:",
+                        "",
+                        "```bash",
+                        str(row["resume"]),
+                        "```",
+                        "",
+                    ]
+                )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def append_history(path: Path, rows: list[dict[str, Any]], scanned_at: str) -> None:
+    record = {"scanned_at": scanned_at, "sessions": rows}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-history", action="store_true", help="do not append to live_sessions_history.jsonl")
+    parser.add_argument("--print", action="store_true", help="print the markdown recovery snapshot after writing it")
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="replace live_sessions.md/tsv even when no live sessions are detected",
+    )
+    args = parser.parse_args()
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    scanned_at = now_iso()
+    rows = scan_codex() + scan_claude()
+    rows = sorted(rows, key=lambda row: (row["tool"], row["cwd"], row["session_id"]))
+
+    markdown_path = OUT_DIR / "live_sessions.md"
+    tsv_path = OUT_DIR / "live_sessions.tsv"
+    if rows or args.allow_empty or not markdown_path.exists():
+        write_tsv(tsv_path, rows)
+        write_markdown(markdown_path, rows, scanned_at)
+        wrote_snapshot = True
+    else:
+        wrote_snapshot = False
+    if not args.no_history:
+        append_history(OUT_DIR / "live_sessions_history.jsonl", rows, scanned_at)
+
+    if args.print:
+        if wrote_snapshot:
+            sys.stdout.write(markdown_path.read_text(encoding="utf-8"))
+        else:
+            print(f"No live sessions detected at {scanned_at}; preserved previous {markdown_path}")
+            sys.stdout.write(markdown_path.read_text(encoding="utf-8"))
+    else:
+        if wrote_snapshot:
+            print(f"Wrote {len(rows)} live sessions to {markdown_path}")
+        else:
+            print(f"No live sessions detected; preserved previous {markdown_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
