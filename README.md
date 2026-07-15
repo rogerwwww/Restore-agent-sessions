@@ -2,6 +2,10 @@
 
 Restore your Codex and Claude Code sessions in WSL+Windows Terminal, so that you won't lose your progress if your PC reboots.
 
+## Demo
+
+![Restore agent sessions demo](agent-restore-showcase.gif)
+
 ## Install
 
 ```bash
