@@ -19,6 +19,8 @@ HOME = Path.home()
 OUT_DIR = HOME / ".agent_sessions"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 CLAUDE_SESSIONS = HOME / ".claude" / "sessions"
+CLAUDE_PROJECTS = HOME / ".claude" / "projects"
+NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]")
 UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -179,12 +181,25 @@ def read_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def claude_project_slug(cwd: str) -> str:
+    # Claude Code names the transcript directory after the cwd with every
+    # non-alphanumeric character replaced by "-", so "/home/u/My_Proj" becomes
+    # "-home-u-My-Proj". Replacing only "/" and " " misses "_", "." and friends.
+    return NON_ALNUM_RE.sub("-", cwd)
+
+
 def claude_project_path(cwd: str, session_id: str) -> str:
-    if not cwd or not session_id:
+    if not session_id:
         return ""
-    encoded = cwd.replace("/", "-").replace(" ", "-")
-    path = HOME / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
-    return str(path) if path.exists() else ""
+    if cwd:
+        path = CLAUDE_PROJECTS / claude_project_slug(cwd) / f"{session_id}.jsonl"
+        if path.exists():
+            return str(path)
+    # The transcript is named after the session id, so fall back to a scan that
+    # does not depend on guessing the directory encoding correctly.
+    for path in sorted(CLAUDE_PROJECTS.glob(f"*/{session_id}.jsonl")):
+        return str(path)
+    return ""
 
 
 def scan_claude() -> list[dict[str, Any]]:
