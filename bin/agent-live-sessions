@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from agent_session_filters import codex_session_meta, is_guardian_review
+
 
 HOME = Path.home()
 OUT_DIR = HOME / ".agent_sessions"
@@ -148,6 +150,9 @@ def scan_codex() -> list[dict[str, Any]]:
             session_id = extract_codex_session_id(session_path)
             if not session_id:
                 continue
+            metadata = codex_session_meta(session_path)
+            if is_guardian_review(metadata):
+                continue
             cwd = proc_cwd(pid) or first_jsonl_value(session_path, ["payload.cwd", "cwd"])
             sessions[session_id] = {
                 "tool": "codex",
@@ -160,6 +165,7 @@ def scan_codex() -> list[dict[str, Any]]:
                 "started": ps_field(pid, "lstart"),
                 "updated": mtime_iso(session_path),
                 "session_path": session_path,
+                "thread_source": metadata.get("thread_source") or "",
                 "recoverable": "yes",
                 "resume": f"cd {shell_quote(cwd)} && codex resume {session_id}" if cwd else f"codex resume {session_id}",
             }
@@ -272,6 +278,7 @@ def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
         "started",
         "updated",
         "session_path",
+        "thread_source",
         "recoverable",
         "resume",
     ]

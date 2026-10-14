@@ -20,3 +20,9 @@ agent-restore-sessions
 ```
 
 Session snapshots are stored in `~/.agent_sessions/`.
+
+Internal Codex Guardian approval-review sessions are excluded from new snapshots
+and skipped when restoring older snapshots, including with `--force`. Detection
+uses rollout metadata (`thread_source: guardian_review` or
+`source.subagent.other: guardian`), rather than conversation titles or content.
+Codex approval review continues to operate normally.

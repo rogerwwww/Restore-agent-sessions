@@ -7,6 +7,7 @@ session_dir="${HOME}/.agent_sessions"
 
 mkdir -p "${bin_dir}" "${session_dir}"
 
+curl -fsSL "${repo_raw}/bin/agent_session_filters.py" -o "${bin_dir}/agent_session_filters.py"
 curl -fsSL "${repo_raw}/bin/agent-live-sessions" -o "${bin_dir}/agent-live-sessions"
 curl -fsSL "${repo_raw}/bin/agent-restore-sessions" -o "${bin_dir}/agent-restore-sessions"
 chmod +x "${bin_dir}/agent-live-sessions" "${bin_dir}/agent-restore-sessions"
