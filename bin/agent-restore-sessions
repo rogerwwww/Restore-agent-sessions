@@ -13,11 +13,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent_session_filters import is_guardian_session
+from agent_session_filters import CodexSessionResolver, is_child_session, is_guardian_session
 
 
 HOME = Path.home()
 DEFAULT_TSV = HOME / ".agent_sessions" / "live_sessions.tsv"
+CODEX_SESSIONS = HOME / ".codex" / "sessions"
 UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -56,6 +57,7 @@ def run(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 def live_session_ids() -> set[str]:
     ids: set[str] = set()
+    resolver = CodexSessionResolver(CODEX_SESSIONS)
 
     codex_pids = run(["pgrep", "-x", "codex"])
     if codex_pids.returncode in (0, 1):
@@ -71,7 +73,14 @@ def live_session_ids() -> set[str]:
                     continue
                 matches = UUID_RE.findall(item)
                 if matches:
-                    ids.add(matches[-1].lower())
+                    session_id = matches[-1].lower()
+                    ids.add(session_id)
+                    root = resolver.root_session({
+                        "tool": "codex", "session_id": session_id,
+                        "session_path": item[1:] if item.startswith("n") else item,
+                    })
+                    if root is not None:
+                        ids.add(root["session_id"].lower())
 
     claude_dir = HOME / ".claude" / "sessions"
     if claude_dir.exists():
@@ -93,6 +102,8 @@ def skip_reason(row: dict[str, str]) -> str:
     # --force only overrides the already-live check, never this exclusion.
     if is_guardian_session(row):
         return "Guardian review"
+    if is_child_session(row):
+        return "child agent"
     if row.get("recoverable") == "no":
         return "non-recoverable"
     if row.get("tool") == "claude" and "/.claude/sessions/" in row.get("session_path", ""):
@@ -102,6 +113,32 @@ def skip_reason(row: dict[str, str]) -> str:
 
 def is_recoverable(row: dict[str, str]) -> bool:
     return not skip_reason(row)
+
+
+def select_sessions(
+    rows: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[tuple[dict[str, str], str]]]:
+    resolver = CodexSessionResolver(CODEX_SESSIONS, rows)
+    selected: dict[tuple[str, str], dict[str, str]] = {}
+    skipped: list[tuple[dict[str, str], str]] = []
+    for row in rows:
+        reason = skip_reason(row)
+        if reason == "child agent":
+            root = resolver.root_session(row)
+            if root is None:
+                skipped.append((row, "child agent (parent unavailable or invalid)"))
+                continue
+            skipped.append((row, f"child agent (using parent {root['session_id']})"))
+            if not skip_reason(root):
+                key = (root.get("tool", ""), root["session_id"].lower())
+                selected.setdefault(key, root)
+        elif reason:
+            skipped.append((row, reason))
+        else:
+            # Prefer a recorded parent row over one synthesized from a child.
+            key = (row.get("tool", ""), row["session_id"].lower())
+            selected[key] = row
+    return list(selected.values()), skipped
 
 
 def tool_command(row: dict[str, str], executables: dict[str, str]) -> str:
@@ -167,14 +204,7 @@ def main() -> int:
     parser.add_argument("--claude-bin", default=shutil.which("claude") or "claude", help="Claude executable path for launched tabs")
     args = parser.parse_args()
 
-    rows: list[dict[str, str]] = []
-    skipped: list[tuple[dict[str, str], str]] = []
-    for row in read_sessions(args.snapshot):
-        reason = skip_reason(row)
-        if reason:
-            skipped.append((row, reason))
-        else:
-            rows.append(row)
+    rows, skipped = select_sessions(read_sessions(args.snapshot))
     already_live: list[dict[str, str]] = []
     if not args.force:
         live_ids = live_session_ids()

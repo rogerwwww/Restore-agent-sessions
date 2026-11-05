@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_session_filters import codex_session_meta, is_guardian_review
+from agent_session_filters import CodexSessionResolver, codex_session_meta, is_guardian_review
 
 
 HOME = Path.home()
@@ -135,6 +135,7 @@ def first_jsonl_value(path: str, keys: list[str]) -> str:
 
 def scan_codex() -> list[dict[str, Any]]:
     sessions: dict[str, dict[str, Any]] = {}
+    resolver = CodexSessionResolver(CODEX_SESSIONS)
     for pid in pids_by_exact_name("codex"):
         if not proc_exists(pid):
             continue
@@ -154,7 +155,7 @@ def scan_codex() -> list[dict[str, Any]]:
             if is_guardian_review(metadata):
                 continue
             cwd = proc_cwd(pid) or first_jsonl_value(session_path, ["payload.cwd", "cwd"])
-            sessions[session_id] = {
+            row = {
                 "tool": "codex",
                 "session_id": session_id,
                 "pid": pid,
@@ -166,9 +167,15 @@ def scan_codex() -> list[dict[str, Any]]:
                 "updated": mtime_iso(session_path),
                 "session_path": session_path,
                 "thread_source": metadata.get("thread_source") or "",
+                "parent_thread_id": metadata.get("parent_thread_id") or "",
                 "recoverable": "yes",
                 "resume": f"cd {shell_quote(cwd)} && codex resume {session_id}" if cwd else f"codex resume {session_id}",
             }
+            root = resolver.root_session(row)
+            if root is not None:
+                sessions.setdefault(root["session_id"], root)
+                if root["session_id"] == session_id:
+                    sessions[session_id] = root
     return sorted(sessions.values(), key=lambda row: (row["tool"], row["cwd"], row["session_id"]))
 
 
@@ -279,6 +286,7 @@ def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
         "updated",
         "session_path",
         "thread_source",
+        "parent_thread_id",
         "recoverable",
         "resume",
     ]

@@ -46,12 +46,10 @@ class GuardianSessionsTest(unittest.TestCase):
                 self.assertTrue(is_guardian_review(metadata))
                 self.assertFalse(RESTORE["is_recoverable"](self.rollout(1, metadata)))
 
-    def test_user_and_other_subagent_sessions_remain_recoverable(self):
+    def test_user_sessions_remain_recoverable(self):
         for metadata in (
             {}, {"source": "cli"}, {"source": "vscode"},
             {"thread_source": "user"},
-            {"source": {"subagent": {"other": "review"}}},
-            {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}}},
             {"source": None}, {"source": {"subagent": "guardian"}},
         ):
             with self.subTest(metadata=metadata):
