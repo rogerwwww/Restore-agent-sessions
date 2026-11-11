@@ -14,7 +14,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_session_filters import CodexSessionResolver, codex_session_meta, is_guardian_review
+from agent_session_filters import (
+    CodexSessionResolver, codex_process_paths, codex_session_id,
+    codex_session_meta, is_guardian_review,
+)
 
 
 HOME = Path.home()
@@ -23,10 +26,6 @@ CODEX_SESSIONS = HOME / ".codex" / "sessions"
 CLAUDE_SESSIONS = HOME / ".claude" / "sessions"
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]")
-UUID_RE = re.compile(
-    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
-)
 
 
 def run(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -87,8 +86,7 @@ def pids_by_exact_name(name: str) -> list[int]:
 
 def lsof_names(pid: int) -> list[str]:
     result = run(["lsof", "-Fn", "-p", str(pid)])
-    if result.returncode != 0:
-        return []
+    # lsof can return useful file names alongside a nonzero exit status.
     names: list[str] = []
     for line in result.stdout.splitlines():
         if line.startswith("n"):
@@ -104,11 +102,7 @@ def mtime_iso(path: str) -> str:
 
 
 def extract_codex_session_id(path: str) -> str:
-    name = Path(path).name
-    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
-        return ""
-    matches = UUID_RE.findall(name)
-    return matches[-1].lower() if matches else ""
+    return codex_session_id(path)
 
 
 def first_jsonl_value(path: str, keys: list[str]) -> str:
@@ -140,21 +134,14 @@ def scan_codex() -> list[dict[str, Any]]:
         if not proc_exists(pid):
             continue
         names = lsof_names(pid)
-        session_paths = [
-            name
-            for name in names
-            if "/.codex/sessions/" in name
-            and "/rollout-" in name
-            and name.endswith(".jsonl")
-        ]
-        for session_path in sorted(set(session_paths)):
-            session_id = extract_codex_session_id(session_path)
+        for session_path in codex_process_paths(pid, names, resolver):
+            metadata = codex_session_meta(session_path)
+            session_id = codex_session_id(session_path, metadata)
             if not session_id:
                 continue
-            metadata = codex_session_meta(session_path)
             if is_guardian_review(metadata):
                 continue
-            cwd = proc_cwd(pid) or first_jsonl_value(session_path, ["payload.cwd", "cwd"])
+            cwd = metadata.get("cwd") or proc_cwd(pid)
             row = {
                 "tool": "codex",
                 "session_id": session_id,

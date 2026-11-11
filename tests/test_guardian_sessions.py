@@ -86,6 +86,7 @@ class GuardianSessionsTest(unittest.TestCase):
         older = self.rollout(3, {"source": {"subagent": {"other": "guardian"}}})
         namespace = LIVE["scan_codex"].__globals__
         with patch.dict(namespace, {
+            "CODEX_SESSIONS": self.root / ".codex" / "sessions",
             "pids_by_exact_name": lambda name: [123],
             "proc_exists": lambda pid: True,
             "lsof_names": lambda pid: [r["session_path"] for r in (user, current, older, user)],

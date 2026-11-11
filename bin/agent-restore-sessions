@@ -5,24 +5,25 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
+import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from agent_session_filters import CodexSessionResolver, is_child_session, is_guardian_session
+from agent_session_filters import (
+    CodexSessionResolver, codex_process_paths, codex_session_id,
+    is_child_session, is_guardian_session,
+)
 
 
 HOME = Path.home()
 DEFAULT_TSV = HOME / ".agent_sessions" / "live_sessions.tsv"
+DEFAULT_HISTORY = HOME / ".agent_sessions" / "live_sessions_history.jsonl"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
-UUID_RE = re.compile(
-    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
-)
 
 
 def default_codex_bin() -> str:
@@ -51,6 +52,42 @@ def read_sessions(path: Path) -> list[dict[str, str]]:
         return [row for row in csv.DictReader(handle, delimiter="\t") if row.get("session_id")]
 
 
+def parse_timestamp(value: str) -> dt.datetime:
+    try:
+        if isinstance(value, str):
+            stamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if stamp.tzinfo is not None:
+                return stamp
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("use an ISO timestamp with a timezone, e.g. 2026-11-10T11:25:01-05:00")
+
+
+def read_history(path: Path, at: dt.datetime) -> list[dict[str, str]]:
+    """Select one complete historical snapshot, without merging closed sessions."""
+    selected = None
+    latest = None
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                    stamp = parse_timestamp(record["scanned_at"])
+                    rows = record["sessions"]
+                    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                        continue
+                except (ValueError, KeyError, TypeError, argparse.ArgumentTypeError):
+                    continue
+                if stamp <= at and (latest is None or stamp >= latest):
+                    latest, selected = stamp, rows
+    except OSError as exc:
+        raise SystemExit(f"cannot read session history {path}: {exc}") from exc
+    if selected is None:
+        raise SystemExit(f"no historical snapshot at or before {at.isoformat()}")
+    print(f"Using snapshot from {latest.isoformat()}", file=sys.stderr)
+    return [row for row in selected if row.get("session_id")]
+
+
 def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, text=True, capture_output=True, check=False)
 
@@ -66,21 +103,18 @@ def live_session_ids() -> set[str]:
             if not pid:
                 continue
             lsof = run(["lsof", "-Fn", "-p", pid])
-            if lsof.returncode != 0:
-                continue
-            for item in lsof.stdout.splitlines():
-                if "/.codex/sessions/" not in item or "/rollout-" not in item:
+            names = [line[1:] for line in lsof.stdout.splitlines() if line.startswith("n")]
+            for path in codex_process_paths(int(pid), names, resolver):
+                session_id = codex_session_id(path)
+                if not session_id:
                     continue
-                matches = UUID_RE.findall(item)
-                if matches:
-                    session_id = matches[-1].lower()
-                    ids.add(session_id)
-                    root = resolver.root_session({
-                        "tool": "codex", "session_id": session_id,
-                        "session_path": item[1:] if item.startswith("n") else item,
-                    })
-                    if root is not None:
-                        ids.add(root["session_id"].lower())
+                ids.add(session_id)
+                root = resolver.root_session({
+                    "tool": "codex", "session_id": session_id,
+                    "session_path": path,
+                })
+                if root is not None:
+                    ids.add(root["session_id"].lower())
 
     claude_dir = HOME / ".claude" / "sessions"
     if claude_dir.exists():
@@ -122,6 +156,8 @@ def select_sessions(
     selected: dict[tuple[str, str], dict[str, str]] = {}
     skipped: list[tuple[dict[str, str], str]] = []
     for row in rows:
+        # Normalize IDs and directories in old snapshots as well as new ones.
+        original = row
         reason = skip_reason(row)
         if reason == "child agent":
             root = resolver.root_session(row)
@@ -135,6 +171,10 @@ def select_sessions(
         elif reason:
             skipped.append((row, reason))
         else:
+            row = resolver.root_session(row)
+            if row is None:
+                skipped.append((original, "parent unavailable or invalid"))
+                continue
             # Prefer a recorded parent row over one synthesized from a child.
             key = (row.get("tool", ""), row["session_id"].lower())
             selected[key] = row
@@ -192,7 +232,10 @@ def build_wt_command(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--snapshot", type=Path, default=DEFAULT_TSV, help=f"session TSV to restore; default: {DEFAULT_TSV}")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--snapshot", type=Path, help=f"session TSV to restore; default: {DEFAULT_TSV}")
+    source.add_argument("--at", type=parse_timestamp, help="restore the last history snapshot at or before this ISO timestamp (include timezone)")
+    parser.add_argument("--history", type=Path, default=DEFAULT_HISTORY, help="JSONL history used with --at")
     parser.add_argument("--distro", default=os.environ.get("WSL_DISTRO_NAME", "Ubuntu-22.04"), help="WSL distro name for wsl.exe -d")
     parser.add_argument("--window", default="0", help="Windows Terminal window target for wt.exe -w; default: 0")
     parser.add_argument("--tool", choices=["codex", "claude"], action="append", help="restore only this tool; repeatable")
@@ -204,7 +247,8 @@ def main() -> int:
     parser.add_argument("--claude-bin", default=shutil.which("claude") or "claude", help="Claude executable path for launched tabs")
     args = parser.parse_args()
 
-    rows, skipped = select_sessions(read_sessions(args.snapshot))
+    recorded = read_history(args.history, args.at) if args.at else read_sessions(args.snapshot or DEFAULT_TSV)
+    rows, skipped = select_sessions(recorded)
     already_live: list[dict[str, str]] = []
     if not args.force:
         live_ids = live_session_ids()

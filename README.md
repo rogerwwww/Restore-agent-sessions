@@ -32,3 +32,24 @@ when restoring older snapshots with `--force`. Recovery follows their parent
 metadata to the root conversation and restores each root once. If the parent
 rollout is missing or invalid, the child is skipped. Ordinary user-created
 forks remain independently recoverable.
+
+Codex IDs and working directories come from the rollout header. Some rollout
+filenames include an extra writer UUID, and the shared daemon's working
+directory may belong to a different project. Older snapshots are corrected
+when restored. Open writer locks and running `codex resume <id>` clients also
+provide recovery evidence when the daemon no longer has an open rollout file.
+
+If a daemon restart or disconnect already removed sessions from the latest
+snapshot, restore a complete earlier snapshot from the append-only history:
+
+```bash
+agent-restore-sessions --at '2026-11-10T11:25:01-05:00' --tool codex --dry-run
+# Remove --dry-run to open the selected sessions.
+```
+
+`--at` selects the latest recorded scan at or before the supplied timestamp;
+include a timezone. It can be combined with the usual live-session checks,
+`--force`, and `--limit`. Use `--history PATH` for a different history file.
+History is not merged automatically, since it also contains sessions that
+were intentionally closed. A disconnected client launched without an explicit
+resume ID may require this history recovery if no rollout or writer lock is open.

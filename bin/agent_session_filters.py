@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+
+UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 
 def codex_session_meta(path: str) -> dict[str, Any]:
@@ -21,6 +28,60 @@ def codex_session_meta(path: str) -> dict[str, Any]:
         return {}
     payload = item.get("payload")
     return payload if isinstance(payload, dict) else {}
+
+
+def codex_session_id(path: str, metadata: Mapping[str, Any] | None = None) -> str:
+    """A rollout may end in a writer UUID; its header owns the thread ID."""
+    if metadata is None:
+        metadata = codex_session_meta(path)
+    for key in ("id", "session_id"):
+        value = metadata.get(key)
+        if isinstance(value, str) and UUID_RE.fullmatch(value):
+            return value.lower()
+    name = Path(path).name
+    if name.startswith("rollout-") and name.endswith(".jsonl"):
+        match = UUID_RE.search(name)
+        if match:
+            return match.group().lower()
+    return ""
+
+
+def codex_resume_id(pid: int) -> str:
+    """Read an explicit CLI resume target when a daemon owns the rollout FD."""
+    try:
+        argv = (Path("/proc") / str(pid) / "cmdline").read_bytes().decode().split("\0")
+    except (OSError, UnicodeError):
+        return ""
+    # Ignore app-server/exec processes and UUIDs in prompts or other arguments.
+    if len(argv) > 2 and argv[1] == "resume" and UUID_RE.fullmatch(argv[2]):
+        return argv[2].lower()
+    return ""
+
+
+def codex_process_paths(
+    pid: int, names: Iterable[str], resolver: CodexSessionResolver,
+) -> list[str]:
+    """Use open rollouts first, then held writer locks or an explicit resume ID."""
+    names = tuple(names)
+    paths = {
+        name for name in names
+        if Path(name).parent.is_relative_to(resolver.sessions_dir)
+        and Path(name).name.startswith("rollout-") and name.endswith(".jsonl")
+    }
+    if not paths:
+        ids = {
+            Path(name).stem for name in names
+            if Path(name).parent == resolver.sessions_dir.parent / "thread-writer-locks"
+            and name.endswith(".lock") and UUID_RE.fullmatch(Path(name).stem)
+        }
+        resume_id = codex_resume_id(pid)
+        if resume_id:
+            ids.add(resume_id)
+        for session_id in ids:
+            path = resolver.session_path(session_id)
+            if path is not None:
+                paths.add(str(path))
+    return sorted(paths)
 
 
 def codex_source(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -101,21 +162,32 @@ class CodexSessionResolver:
         if not self.indexed:
             # Index names once, lazily; read headers only along parent chains.
             for candidate in self.sessions_dir.rglob("rollout-*.jsonl"):
-                candidate_id = candidate.stem[-36:].lower()
-                known = self.paths.get(candidate_id)
-                if known is None or not known.is_file():
-                    self.paths[candidate_id] = candidate
+                # Index both thread and writer IDs to repair older snapshots.
+                for candidate_id in UUID_RE.findall(candidate.name):
+                    candidate_id = candidate_id.lower()
+                    known = self.paths.get(candidate_id)
+                    if known is None or not known.is_file():
+                        self.paths[candidate_id] = candidate
             self.indexed = True
         path = self.paths.get(key)
         return path if path is not None and path.is_file() else None
 
     def root_session(self, row: Mapping[str, Any]) -> dict[str, Any] | None:
+        if row.get("tool") != "codex":
+            return dict(row)
         if is_guardian_session(row):
             return None
+        row = dict(row)
         metadata = codex_session_meta(row.get("session_path") or "")
+        session_id = codex_session_id(row.get("session_path") or "", metadata)
+        if metadata and session_id:
+            cwd = metadata.get("cwd") or row.get("cwd") or ""
+            resume = f"codex resume {shlex.quote(session_id)}"
+            row.update(session_id=session_id, cwd=cwd,
+                       resume=f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume)
         if not is_child_agent(metadata):
             metadata = dict(row)
-        if row.get("tool") != "codex" or not is_child_agent(metadata):
+        if not is_child_agent(metadata):
             return dict(row)
 
         seen = {str(row.get("session_id", "")).lower()}

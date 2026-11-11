@@ -190,7 +190,10 @@ class ChildSessionsTest(unittest.TestCase):
         for row in (user, claude):
             self.assertTrue(RESTORE["is_recoverable"](row))
         selected, skipped = RESTORE["select_sessions"]([user, claude])
-        self.assertEqual(selected, [user, claude])
+        self.assertEqual([row["session_id"] for row in selected], [user["session_id"], claude["session_id"]])
+        self.assertEqual(selected[0]["name"], user["name"])
+        self.assertEqual(selected[0]["cwd"], "/root-project")
+        self.assertEqual(selected[1], claude)
         self.assertEqual(skipped, [])
 
     def test_stale_parent_path_in_snapshot_is_found_at_current_location(self):
